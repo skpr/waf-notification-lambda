@@ -36,7 +36,7 @@ func main() {
 func handle(ctx context.Context) error {
 	cfg := Config{}
 
-	if err := env.Load(&cfg, nil); err != nil {
+	if err := env.Load(&cfg, &env.Options{SliceSep: ","}); err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
