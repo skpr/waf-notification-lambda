@@ -9,14 +9,21 @@ import (
 	"github.com/skpr/waf-notification-lambda/internal/types"
 )
 
-func PostMessage(ips []types.BlockedIP, webhooks []string) error {
+func PostMessage(title, description string, ips []types.BlockedIP, webhooks []string) error {
 	doc := Document{
 		Blocks: []Block{
+			{
+				Type: "header",
+				Text: &Text{
+					Type: "mrkdwn",
+					Text: title,
+				},
+			},
 			{
 				Type: "section",
 				Text: &Text{
 					Type: "mrkdwn",
-					Text: "*The IPs below were recently blocked by the Skpr WAF solution*",
+					Text: description,
 				},
 			},
 			{

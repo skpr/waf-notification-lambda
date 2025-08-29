@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"slices"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,15 +19,19 @@ import (
 	skpripinfo "github.com/skpr/waf-notification-lambda/internal/ipinfo"
 	"github.com/skpr/waf-notification-lambda/internal/slack"
 	skprsqs "github.com/skpr/waf-notification-lambda/internal/sqs"
+	"github.com/skpr/waf-notification-lambda/internal/types"
 )
 
 // Config holds the configuration for the application, loaded from environment variables.
 type Config struct {
-	Bucket      string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BUCKET,required" usage:"Bucket to pull S3 objects from"`
-	QueueURL    string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SQS_QUEUE_URL,required" usage:"SQS Queue URL to read messages from"`
-	BatchSize   int      `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BATCH_SIZE" default:"100" usage:"Number of IPs to send in each Slack message"`
-	Webhooks    []string `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SLACK_WEBHOOKS,required" usage:"Slack webhook URLs to send messages to"`
-	IPInfoToken string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_IPINFO_TOKEN,required" usage:"Token for authenticating with IPInfo.io"`
+	Bucket                  string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BUCKET,required" usage:"Bucket to pull S3 objects from"`
+	QueueURL                string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SQS_QUEUE_URL,required" usage:"SQS Queue URL to read messages from"`
+	BatchSize               int      `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BATCH_SIZE" default:"100" usage:"Number of IPs to send in each Slack message"`
+	Webhooks                []string `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SLACK_WEBHOOKS,required" usage:"Slack webhook URLs to send messages to"`
+	IPInfoToken             string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_IPINFO_TOKEN,required" usage:"Token for authenticating with IPInfo.io"`
+	AllowedRulesIDs         []string `env:"SKPR_WAF_NOTIFICATION_LAMBDA_ALLOWED_RULES_IDS,required" usage:"Comma-separated list of allowed WAF rule IDs"`
+	SlackMessageTitle       string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SLACK_MESSAGE_TITLE" default:"WAF Blocked IPs" usage:"Title for the Slack message"`
+	SlackMessageDescription string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SLACK_MESSAGE_DESCRIPTION" default:"The following IPs have been blocked by the WAF:" usage:"Description for the Slack message"`
 }
 
 func main() {
@@ -98,7 +103,7 @@ func run(ctx context.Context, cfg Config) error {
 
 	logger.Info("Processing keys", slog.Int("count", len(keys)))
 
-	mappedIPs, err := handleKeys(ctx, logger, s3Client, cfg.Bucket, keys)
+	mappedIPs, err := handleKeys(ctx, logger, s3Client, cfg.Bucket, keys, cfg.AllowedRulesIDs)
 	if err != nil {
 		return fmt.Errorf("failed to handle keys: %w", err)
 	}
@@ -110,6 +115,14 @@ func run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to decorate IPs: %w", err)
 	}
 
+	logger.Info("Sorting IPs", slog.Int("count", len(ips)))
+
+	slices.SortFunc(ips, func(a, b types.BlockedIP) int {
+		return b.Count - a.Count
+	})
+
+	logger.Info("Sending messages to Slack", slog.Int("unique_ips", len(ips)), slog.Int("batch_size", cfg.BatchSize))
+
 	for i := 0; i < len(ips); i += cfg.BatchSize {
 		end := i + cfg.BatchSize
 		if end > len(ips) {
@@ -118,7 +131,7 @@ func run(ctx context.Context, cfg Config) error {
 
 		batch := ips[i:end]
 
-		err = slack.PostMessage(batch, cfg.Webhooks)
+		err = slack.PostMessage(cfg.SlackMessageTitle, cfg.SlackMessageDescription, batch, cfg.Webhooks)
 		if err != nil {
 			return fmt.Errorf("failed to post to slack: %w", err)
 		}

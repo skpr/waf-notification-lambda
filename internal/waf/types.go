@@ -3,7 +3,7 @@ package waf
 // Log represents the structure of a single WAF log entry stored in S3.
 type Log struct {
 	Action            string      `json:"action"`
-	TerminatingRuleId string      `json:"terminatingRuleId"`
+	TerminatingRuleID string      `json:"terminatingRuleId"`
 	HTTPSourceName    string      `json:"httpSourceName"`
 	HTTPSourceId      string      `json:"httpSourceId"`
 	HTTPRequest       HTTPRequest `json:"httpRequest"`
