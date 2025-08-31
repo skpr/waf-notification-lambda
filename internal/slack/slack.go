@@ -15,7 +15,7 @@ func PostMessage(title, description string, ips []types.BlockedIP, webhooks []st
 			{
 				Type: "header",
 				Text: &Text{
-					Type: "mrkdwn",
+					Type: "plain_text",
 					Text: title,
 				},
 			},
@@ -42,7 +42,7 @@ func PostMessage(title, description string, ips []types.BlockedIP, webhooks []st
 		newTextCell("Org", true),
 		newTextCell("Count", true),
 	}
-	doc.Blocks[1].Rows = append(doc.Blocks[1].Rows, header)
+	doc.Blocks[2].Rows = append(doc.Blocks[2].Rows, header)
 
 	for _, ip := range ips {
 		row := []Cell{
@@ -53,7 +53,7 @@ func PostMessage(title, description string, ips []types.BlockedIP, webhooks []st
 			newTextCell(ip.Org, false),
 			newTextCell(fmt.Sprintf("%d", ip.Count), false),
 		}
-		doc.Blocks[1].Rows = append(doc.Blocks[1].Rows, row)
+		doc.Blocks[2].Rows = append(doc.Blocks[2].Rows, row)
 	}
 
 	out, err := json.Marshal(doc)
@@ -85,16 +85,16 @@ func sendToWebhook(webhook string, content []byte) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	buf := new(bytes.Buffer)
-
 	_, err = buf.ReadFrom(resp.Body)
 	if err != nil {
 		return err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("returned status code: %d", resp.StatusCode)
+		return fmt.Errorf("returned status code: %d, body: %s", resp.StatusCode, buf.String())
 	}
 
 	return nil
