@@ -9,47 +9,80 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/skpr/waf-notification-lambda/internal/types"
 	"github.com/skpr/waf-notification-lambda/internal/waf"
 )
 
-// handleS3Objects processes multiple S3 keys, aggregating IP information from each.
+// limit concurrency so we don't hammer S3 / exhaust Lambda CPU
+const maxConcurrency = 8
+
+// handleS3Objects processes multiple S3 keys concurrently, aggregating IP information from each.
 func handleS3Objects(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, s3client *s3.Client, bucket string, keys, allowedRulesIDs []string) (map[string]types.BlockedIP, error) {
 	ctx, span := tracer.Start(ctx, "handleS3Objects")
 	span.SetAttributes(
 		attribute.String("s3.bucket", bucket),
+		attribute.Int("s3.keys_count", len(keys)),
 	)
 	defer span.End()
 
 	countedIPs := make(map[string]types.BlockedIP)
+	var mu sync.Mutex
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.SetLimit(maxConcurrency)
 
 	for _, key := range keys {
-		ips, err := handleS3Object(ctx, tracer, logger, s3client, bucket, key, allowedRulesIDs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to handle event %s: %w", key, err)
-		}
+		key := key // capture loop variable
 
-		if ips == nil {
-			continue
-		}
-
-		for ip, count := range ips {
-			if val, exists := countedIPs[ip]; exists {
-				val.Count += count
-				countedIPs[ip] = val
-			} else {
-				countedIPs[ip] = types.BlockedIP{IP: ip, Count: 1}
+		g.Go(func() error {
+			ips, err := handleS3Object(ctx, tracer, logger, s3client, bucket, key, allowedRulesIDs)
+			if err != nil {
+				return fmt.Errorf("failed to handle event %s: %w", key, err)
 			}
-		}
+
+			if ips == nil {
+				return nil
+			}
+
+			// merge into shared map
+			mu.Lock()
+			defer mu.Unlock()
+
+			for ip, count := range ips {
+				if val, exists := countedIPs[ip]; exists {
+					val.Count += count
+					countedIPs[ip] = val
+				} else {
+					countedIPs[ip] = types.BlockedIP{
+						IP:    ip,
+						Count: count,
+					}
+				}
+			}
+
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	logger.Info("Finished processing S3 objects",
+		slog.Int("keys", len(keys)),
+		slog.Int("unique_ips", len(countedIPs)),
+	)
 
 	return countedIPs, nil
 }
