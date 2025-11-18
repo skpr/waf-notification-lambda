@@ -101,7 +101,8 @@ func run(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, cfg Conf
 		output, err := sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(cfg.QueueURL),
 			MaxNumberOfMessages: 10,
-			WaitTimeSeconds:     5,
+			// We don't want to long poll. Leave it for the next execution.
+			WaitTimeSeconds: 0,
 		})
 		if err != nil {
 			log.Fatalf("failed to receive message, %v", err)
