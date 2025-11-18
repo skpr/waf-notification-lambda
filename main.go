@@ -58,7 +58,7 @@ func main() {
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(xray.Propagator{})
 
-	lambda.Start(otellambda.InstrumentHandler(handle(ctx), xrayconfig.WithRecommendedOptions(tp)...))
+	lambda.Start(otellambda.InstrumentHandler(handle, xrayconfig.WithRecommendedOptions(tp)...))
 }
 
 func handle(ctx context.Context) error {
@@ -83,7 +83,7 @@ func run(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, cfg Conf
 
 	c, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to setup client: %d", err)
+		return fmt.Errorf("failed to setup client: %w", err)
 	}
 
 	var (
