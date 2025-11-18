@@ -10,20 +10,29 @@ import (
 	"log/slog"
 	"slices"
 
-	"github.com/skpr/waf-notification-lambda/internal/types"
-	"github.com/skpr/waf-notification-lambda/internal/waf"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/skpr/waf-notification-lambda/internal/types"
+	"github.com/skpr/waf-notification-lambda/internal/waf"
 )
 
-// handleKeys processes multiple S3 keys, aggregating IP information from each.
-func handleKeys(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bucket string, keys, allowedRulesIDs []string) (map[string]types.BlockedIP, error) {
+// handleS3Objects processes multiple S3 keys, aggregating IP information from each.
+func handleS3Objects(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, s3client *s3.Client, bucket string, keys, allowedRulesIDs []string) (map[string]types.BlockedIP, error) {
+	ctx, span := tracer.Start(ctx, "handleS3Objects")
+	span.SetAttributes(
+		attribute.String("s3.bucket", bucket),
+	)
+	defer span.End()
+
 	countedIPs := make(map[string]types.BlockedIP)
 
 	for _, key := range keys {
-		ips, err := handleKey(ctx, logger, s3client, bucket, key, allowedRulesIDs)
+		ips, err := handleS3Object(ctx, tracer, logger, s3client, bucket, key, allowedRulesIDs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to handle event %s: %w", key, err)
 		}
@@ -45,8 +54,15 @@ func handleKeys(ctx context.Context, logger *slog.Logger, s3client *s3.Client, b
 	return countedIPs, nil
 }
 
-// handleKey processes a single S3 key, downloading and parsing the WAF logs.
-func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bucket, key string, allowedRulesIDs []string) (map[string]int, error) {
+// handleS3Object processes a single S3 object, downloading and parsing the WAF logs.
+func handleS3Object(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, s3client *s3.Client, bucket, key string, allowedRulesIDs []string) (map[string]int, error) {
+	ctx, span := tracer.Start(ctx, "handleS3Object")
+	span.SetAttributes(
+		attribute.String("s3.bucket", bucket),
+		attribute.String("s3.key", key),
+	)
+	defer span.End()
+
 	logger.Info("Handling event", slog.String("uri", key))
 
 	logger.Info("Downloading object from S3", slog.String("uri", key))
@@ -58,6 +74,8 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 		Key:    aws.String(key),
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to download from S3")
 		return nil, fmt.Errorf("failed to download %s from %s: %w", key, bucket, err)
 	}
 
@@ -65,6 +83,8 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 
 	gzipReader, err := gzip.NewReader(bytes.NewBuffer(gzipped.Bytes()))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "gzip read error")
 		return nil, fmt.Errorf("error reading gzip: %w", err)
 	}
 	defer gzipReader.Close()
@@ -73,6 +93,12 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 
 	scanner := bufio.NewScanner(gzipReader)
 
+	_, scanSpan := tracer.Start(ctx, "scanAndParseLines")
+	defer scanSpan.End()
+
+	lineCount := 0
+	matchedCount := 0
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -80,6 +106,8 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 		if len(line) < 1 {
 			continue
 		}
+
+		lineCount++
 
 		var log waf.Log
 
@@ -92,6 +120,8 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 			continue
 		}
 
+		matchedCount++
+
 		if val, exists := ips[log.HTTPRequest.ClientIP]; exists {
 			ips[log.HTTPRequest.ClientIP] = val + 1
 		} else {
@@ -100,8 +130,16 @@ func handleKey(ctx context.Context, logger *slog.Logger, s3client *s3.Client, bu
 	}
 
 	if err := scanner.Err(); err != nil {
+		scanSpan.RecordError(err)
+		scanSpan.SetStatus(codes.Error, "scanner error")
 		return nil, fmt.Errorf("scanner error: %w", err)
 	}
+
+	scanSpan.SetAttributes(
+		attribute.Int("logs.total_lines", lineCount),
+		attribute.Int("logs.matched_lines", matchedCount),
+		attribute.Int("ips.unique_count", len(ips)),
+	)
 
 	return ips, nil
 }

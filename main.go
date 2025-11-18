@@ -15,6 +15,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/ipinfo/go/v2/ipinfo"
 	"go-simpler.org/env"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-lambda-go/otellambda/xrayconfig"
+	"go.opentelemetry.io/contrib/propagators/aws/xray"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	skpripinfo "github.com/skpr/waf-notification-lambda/internal/ipinfo"
 	"github.com/skpr/waf-notification-lambda/internal/slack"
@@ -24,6 +29,7 @@ import (
 
 // Config holds the configuration for the application, loaded from environment variables.
 type Config struct {
+	ServiceName             string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SERVICE_NAME" usage:"Name of the service for logging and telemetry"`
 	Bucket                  string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BUCKET,required" usage:"Bucket to pull S3 objects from"`
 	QueueURL                string   `env:"SKPR_WAF_NOTIFICATION_LAMBDA_SQS_QUEUE_URL,required" usage:"SQS Queue URL to read messages from"`
 	BatchSize               int      `env:"SKPR_WAF_NOTIFICATION_LAMBDA_BATCH_SIZE" default:"100" usage:"Number of IPs to send in each Slack message"`
@@ -35,7 +41,24 @@ type Config struct {
 }
 
 func main() {
-	lambda.Start(handle)
+	ctx := context.Background()
+
+	tp, err := xrayconfig.NewTracerProvider(ctx)
+	if err != nil {
+		fmt.Printf("error creating tracer provider: %v", err)
+	}
+
+	defer func(ctx context.Context) {
+		err := tp.Shutdown(ctx)
+		if err != nil {
+			fmt.Printf("error shutting down tracer provider: %v", err)
+		}
+	}(ctx)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(xray.Propagator{})
+
+	lambda.Start(otellambda.InstrumentHandler(handle(ctx), xrayconfig.WithRecommendedOptions(tp)...))
 }
 
 func handle(ctx context.Context) error {
@@ -45,11 +68,18 @@ func handle(ctx context.Context) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	return run(ctx, cfg)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	tracer := otel.Tracer(cfg.ServiceName)
+	ctx, span := tracer.Start(ctx, "handle")
+	defer span.End()
+
+	return run(ctx, tracer, logger, cfg)
 }
 
-func run(ctx context.Context, cfg Config) error {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+func run(ctx context.Context, tracer trace.Tracer, logger *slog.Logger, cfg Config) error {
+	ctx, span := tracer.Start(ctx, "run")
+	defer span.End()
 
 	c, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -63,10 +93,12 @@ func run(ctx context.Context, cfg Config) error {
 
 	var keys []string
 
+	_, receiveMessagesSpan := tracer.Start(ctx, "receiveMessage")
+
 	// Loop all the messages and extract the keys we need and extract the logs from.
 	for {
 		// Receive messages (max 10 at a time)
-		output, err := sqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
+		output, err := sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(cfg.QueueURL),
 			MaxNumberOfMessages: 10,
 			WaitTimeSeconds:     5,
@@ -101,19 +133,25 @@ func run(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	receiveMessagesSpan.End()
+
 	logger.Info("Processing keys", slog.Int("count", len(keys)))
 
-	mappedIPs, err := handleKeys(ctx, logger, s3Client, cfg.Bucket, keys, cfg.AllowedRulesIDs)
+	mappedIPs, err := handleS3Objects(ctx, tracer, logger, s3Client, cfg.Bucket, keys, cfg.AllowedRulesIDs)
 	if err != nil {
 		return fmt.Errorf("failed to handle keys: %w", err)
 	}
 
 	logger.Info("Decorating IPs", slog.Int("count", len(mappedIPs)))
 
+	ctx, decorateSpan := tracer.Start(ctx, "decorateBlockedIPs")
+
 	ips, err := skpripinfo.DecorateBlockedIPs(ipinfo.NewClient(nil, nil, cfg.IPInfoToken), mappedIPs)
 	if err != nil {
 		return fmt.Errorf("failed to decorate IPs: %w", err)
 	}
+
+	decorateSpan.End()
 
 	logger.Info("Sorting IPs", slog.Int("count", len(ips)))
 
@@ -122,6 +160,8 @@ func run(ctx context.Context, cfg Config) error {
 	})
 
 	logger.Info("Sending messages to Slack", slog.Int("unique_ips", len(ips)), slog.Int("batch_size", cfg.BatchSize))
+
+	ctx, slackSpan := tracer.Start(ctx, "sendToSlack")
 
 	for i := 0; i < len(ips); i += cfg.BatchSize {
 		end := i + cfg.BatchSize
@@ -136,6 +176,8 @@ func run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("failed to post to slack: %w", err)
 		}
 	}
+
+	slackSpan.End()
 
 	logger.Info("Finished processing keys", slog.Int("unique_ips", len(ips)))
 
